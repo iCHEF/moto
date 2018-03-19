@@ -2,6 +2,7 @@ from __future__ import unicode_literals
 
 import base64
 import hashlib
+import json
 import re
 import six
 import struct
@@ -9,12 +10,15 @@ from xml.sax.saxutils import escape
 
 import boto.sqs
 
+from moto.core.exceptions import RESTError
 from moto.core import BaseBackend, BaseModel
 from moto.core.utils import camelcase_to_underscores, get_random_message_id, unix_time, unix_time_millis
 from .utils import generate_receipt_handle
 from .exceptions import (
+    MessageAttributesInvalid,
+    MessageNotInflight,
+    QueueDoesNotExist,
     ReceiptHandleIsInvalid,
-    MessageNotInflight
 )
 
 DEFAULT_ACCOUNT_ID = 123456789012
@@ -59,6 +63,7 @@ class Message(BaseModel):
                 return str.encode('utf-8')
             return str
         md5 = hashlib.md5()
+        struct_format = "!I".encode('ascii')  # ensure it's a bytestring
         for name in sorted(self.message_attributes.keys()):
             attr = self.message_attributes[name]
             data_type = attr['data_type']
@@ -67,10 +72,10 @@ class Message(BaseModel):
             # Each part of each attribute is encoded right after it's
             # own length is packed into a 4-byte integer
             # 'timestamp' -> b'\x00\x00\x00\t'
-            encoded += struct.pack("!I", len(utf8(name))) + utf8(name)
+            encoded += struct.pack(struct_format, len(utf8(name))) + utf8(name)
             # The datatype is additionally given a final byte
             # representing which type it is
-            encoded += struct.pack("!I", len(data_type)) + utf8(data_type)
+            encoded += struct.pack(struct_format, len(data_type)) + utf8(data_type)
             encoded += TRANSPORT_TYPE_ENCODINGS[data_type]
 
             if data_type == 'String' or data_type == 'Number':
@@ -86,7 +91,7 @@ class Message(BaseModel):
                 # MD5 so as not to break client softwre
                 return('deadbeefdeadbeefdeadbeefdeadbeef')
 
-            encoded += struct.pack("!I", len(utf8(value))) + utf8(value)
+            encoded += struct.pack(struct_format, len(utf8(value))) + utf8(value)
 
             md5.update(encoded)
         return md5.hexdigest()
@@ -150,35 +155,81 @@ class Queue(BaseModel):
     camelcase_attributes = ['ApproximateNumberOfMessages',
                             'ApproximateNumberOfMessagesDelayed',
                             'ApproximateNumberOfMessagesNotVisible',
+                            'ContentBasedDeduplication',
                             'CreatedTimestamp',
                             'DelaySeconds',
+                            'FifoQueue',
+                            'KmsDataKeyReusePeriodSeconds',
+                            'KmsMasterKeyId',
                             'LastModifiedTimestamp',
                             'MaximumMessageSize',
                             'MessageRetentionPeriod',
                             'QueueArn',
                             'ReceiveMessageWaitTimeSeconds',
+                            'RedrivePolicy',
                             'VisibilityTimeout',
                             'WaitTimeSeconds']
+    ALLOWED_PERMISSIONS = ('*', 'ChangeMessageVisibility', 'DeleteMessage', 'GetQueueAttributes',
+                          'GetQueueUrl', 'ReceiveMessage', 'SendMessage')
 
-    def __init__(self, name, visibility_timeout, wait_time_seconds, region):
+    def __init__(self, name, region, **kwargs):
         self.name = name
-        self.visibility_timeout = visibility_timeout or 30
+        self.visibility_timeout = int(kwargs.get('VisibilityTimeout', 30))
         self.region = region
+        self.tags = {}
 
-        # wait_time_seconds will be set to immediate return messages
-        self.wait_time_seconds = int(wait_time_seconds) if wait_time_seconds else 0
         self._messages = []
 
         now = unix_time()
 
+        # kwargs can also have:
+        # [Policy, RedrivePolicy]
+        self.fifo_queue = kwargs.get('FifoQueue', 'false') == 'true'
+        self.content_based_deduplication = kwargs.get('ContentBasedDeduplication', 'false') == 'true'
+        self.kms_master_key_id = kwargs.get('KmsMasterKeyId', 'alias/aws/sqs')
+        self.kms_data_key_reuse_period_seconds = int(kwargs.get('KmsDataKeyReusePeriodSeconds', 300))
         self.created_timestamp = now
-        self.delay_seconds = 0
+        self.delay_seconds = int(kwargs.get('DelaySeconds', 0))
         self.last_modified_timestamp = now
-        self.maximum_message_size = 64 << 10
-        self.message_retention_period = 86400 * 4  # four days
-        self.queue_arn = 'arn:aws:sqs:{0}:123456789012:{1}'.format(
-            self.region, self.name)
-        self.receive_message_wait_time_seconds = 0
+        self.maximum_message_size = int(kwargs.get('MaximumMessageSize', 64 << 10))
+        self.message_retention_period = int(kwargs.get('MessageRetentionPeriod', 86400 * 4))  # four days
+        self.queue_arn = 'arn:aws:sqs:{0}:123456789012:{1}'.format(self.region, self.name)
+        self.receive_message_wait_time_seconds = int(kwargs.get('ReceiveMessageWaitTimeSeconds', 0))
+        self.permissions = {}
+
+        # wait_time_seconds will be set to immediate return messages
+        self.wait_time_seconds = int(kwargs.get('WaitTimeSeconds', 0))
+
+        self.redrive_policy = {}
+        self.dead_letter_queue = None
+
+        if 'RedrivePolicy' in kwargs:
+            self._setup_dlq(kwargs['RedrivePolicy'])
+
+        # Check some conditions
+        if self.fifo_queue and not self.name.endswith('.fifo'):
+            raise MessageAttributesInvalid('Queue name must end in .fifo for FIFO queues')
+
+    def _setup_dlq(self, policy_json):
+        try:
+            self.redrive_policy = json.loads(policy_json)
+        except ValueError:
+            raise RESTError('InvalidParameterValue', 'Redrive policy does not contain valid json')
+
+        if 'deadLetterTargetArn' not in self.redrive_policy:
+            raise RESTError('InvalidParameterValue', 'Redrive policy does not contain deadLetterTargetArn')
+        if 'maxReceiveCount' not in self.redrive_policy:
+            raise RESTError('InvalidParameterValue', 'Redrive policy does not contain maxReceiveCount')
+
+        for queue in sqs_backends[self.region].queues.values():
+            if queue.queue_arn == self.redrive_policy['deadLetterTargetArn']:
+                self.dead_letter_queue = queue
+
+                if self.fifo_queue and not queue.fifo_queue:
+                    raise RESTError('InvalidParameterCombination', 'Fifo queues cannot use non fifo dead letter queues')
+                break
+        else:
+            raise RESTError('AWS.SimpleQueueService.NonExistentQueue', 'Could not find DLQ for {0}'.format(self.redrive_policy['deadLetterTargetArn']))
 
     @classmethod
     def create_from_cloudformation_json(cls, resource_name, cloudformation_json, region_name):
@@ -187,8 +238,8 @@ class Queue(BaseModel):
         sqs_backend = sqs_backends[region_name]
         return sqs_backend.create_queue(
             name=properties['QueueName'],
-            visibility_timeout=properties.get('VisibilityTimeout'),
-            wait_time_seconds=properties.get('WaitTimeSeconds')
+            region=region_name,
+            **properties
         )
 
     @classmethod
@@ -232,8 +283,12 @@ class Queue(BaseModel):
     def attributes(self):
         result = {}
         for attribute in self.camelcase_attributes:
-            result[attribute] = getattr(
-                self, camelcase_to_underscores(attribute))
+            attr = getattr(self, camelcase_to_underscores(attribute))
+            if isinstance(attr, bool):
+                attr = str(attr).lower()
+            elif attribute == 'RedrivePolicy':
+                attr = json.dumps(attr)
+            result[attribute] = attr
         return result
 
     def url(self, request_url):
@@ -267,11 +322,14 @@ class SQSBackend(BaseBackend):
         self.__dict__ = {}
         self.__init__(region_name)
 
-    def create_queue(self, name, visibility_timeout, wait_time_seconds):
+    def create_queue(self, name, **kwargs):
         queue = self.queues.get(name)
         if queue is None:
-            queue = Queue(name, visibility_timeout,
-                          wait_time_seconds, self.region_name)
+            try:
+                kwargs.pop('region')
+            except KeyError:
+                pass
+            queue = Queue(name, region=self.region_name, **kwargs)
             self.queues[name] = queue
         return queue
 
@@ -287,7 +345,10 @@ class SQSBackend(BaseBackend):
         return qs
 
     def get_queue(self, queue_name):
-        return self.queues.get(queue_name, None)
+        queue = self.queues.get(queue_name)
+        if queue is None:
+            raise QueueDoesNotExist()
+        return queue
 
     def delete_queue(self, queue_name):
         if queue_name in self.queues:
@@ -357,15 +418,24 @@ class SQSBackend(BaseBackend):
                 time.sleep(0.001)
                 continue
 
+            messages_to_dlq = []
             for message in queue.messages:
                 if not message.visible:
                     continue
+                if queue.dead_letter_queue is not None and message.approximate_receive_count >= queue.redrive_policy['maxReceiveCount']:
+                    messages_to_dlq.append(message)
+                    continue
+
                 message.mark_received(
                     visibility_timeout=visibility_timeout
                 )
                 result.append(message)
                 if len(result) >= count:
                     break
+
+            for message in messages_to_dlq:
+                queue._messages.remove(message)
+                queue.dead_letter_queue.add_message(message)
 
         return result
 
@@ -393,6 +463,49 @@ class SQSBackend(BaseBackend):
     def purge_queue(self, queue_name):
         queue = self.get_queue(queue_name)
         queue._messages = []
+
+    def list_dead_letter_source_queues(self, queue_name):
+        dlq = self.get_queue(queue_name)
+
+        queues = []
+        for queue in self.queues.values():
+            if queue.dead_letter_queue is dlq:
+                queues.append(queue)
+
+        return queues
+
+    def add_permission(self, queue_name, actions, account_ids, label):
+        queue = self.get_queue(queue_name)
+
+        if actions is None or len(actions) == 0:
+            raise RESTError('InvalidParameterValue', 'Need at least one Action')
+        if account_ids is None or len(account_ids) == 0:
+            raise RESTError('InvalidParameterValue', 'Need at least one Account ID')
+
+        if not all([item in Queue.ALLOWED_PERMISSIONS for item in actions]):
+            raise RESTError('InvalidParameterValue', 'Invalid permissions')
+
+        queue.permissions[label] = (account_ids, actions)
+
+    def remove_permission(self, queue_name, label):
+        queue = self.get_queue(queue_name)
+
+        if label not in queue.permissions:
+            raise RESTError('InvalidParameterValue', 'Permission doesnt exist for the given label')
+
+        del queue.permissions[label]
+
+    def tag_queue(self, queue_name, tags):
+        queue = self.get_queue(queue_name)
+        queue.tags.update(tags)
+
+    def untag_queue(self, queue_name, tag_keys):
+        queue = self.get_queue(queue_name)
+        for key in tag_keys:
+            try:
+                del queue.tags[key]
+            except KeyError:
+                pass
 
 
 sqs_backends = {}

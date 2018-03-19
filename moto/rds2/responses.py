@@ -23,6 +23,7 @@ class RDS2Response(BaseResponse):
             "db_instance_identifier": self._get_param('DBInstanceIdentifier'),
             "db_name": self._get_param("DBName"),
             "db_parameter_group_name": self._get_param("DBParameterGroupName"),
+            "db_snapshot_identifier": self._get_param('DBSnapshotIdentifier'),
             "db_subnet_group_name": self._get_param("DBSubnetGroupName"),
             "engine": self._get_param("Engine"),
             "engine_version": self._get_param("EngineVersion"),
@@ -122,7 +123,7 @@ class RDS2Response(BaseResponse):
             start = all_ids.index(marker) + 1
         else:
             start = 0
-        page_size = self._get_param('MaxRecords', 50)  # the default is 100, but using 50 to make testing easier
+        page_size = self._get_int_param('MaxRecords', 50)  # the default is 100, but using 50 to make testing easier
         instances_resp = all_instances[start:start + page_size]
         next_marker = None
         if len(all_instances) > start + page_size:
@@ -134,6 +135,9 @@ class RDS2Response(BaseResponse):
     def modify_db_instance(self):
         db_instance_identifier = self._get_param('DBInstanceIdentifier')
         db_kwargs = self._get_db_kwargs()
+        new_db_instance_identifier = self._get_param('NewDBInstanceIdentifier')
+        if new_db_instance_identifier:
+            db_kwargs['new_db_instance_identifier'] = new_db_instance_identifier
         database = self.backend.modify_database(
             db_instance_identifier, db_kwargs)
         template = self.response_template(MODIFY_DATABASE_TEMPLATE)
@@ -192,6 +196,19 @@ class RDS2Response(BaseResponse):
         self.backend.remove_tags_from_resource(arn, tag_keys)
         template = self.response_template(REMOVE_TAGS_FROM_RESOURCE_TEMPLATE)
         return template.render()
+
+    def stop_db_instance(self):
+        db_instance_identifier = self._get_param('DBInstanceIdentifier')
+        db_snapshot_identifier = self._get_param('DBSnapshotIdentifier')
+        database = self.backend.stop_database(db_instance_identifier, db_snapshot_identifier)
+        template = self.response_template(STOP_DATABASE_TEMPLATE)
+        return template.render(database=database)
+
+    def start_db_instance(self):
+        db_instance_identifier = self._get_param('DBInstanceIdentifier')
+        database = self.backend.start_database(db_instance_identifier)
+        template = self.response_template(START_DATABASE_TEMPLATE)
+        return template.render(database=database)
 
     def create_db_security_group(self):
         group_name = self._get_param('DBSecurityGroupName')
@@ -410,6 +427,23 @@ REBOOT_DATABASE_TEMPLATE = """<RebootDBInstanceResponse xmlns="http://rds.amazon
   </ResponseMetadata>
 </RebootDBInstanceResponse>"""
 
+START_DATABASE_TEMPLATE = """<StartDBInstanceResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
+  <StartDBInstanceResult>
+  {{ database.to_xml() }}
+  </StartDBInstanceResult>
+  <ResponseMetadata>
+    <RequestId>523e3218-afc7-11c3-90f5-f90431260ab9</RequestId>
+  </ResponseMetadata>
+</StartDBInstanceResponse>"""
+
+STOP_DATABASE_TEMPLATE = """<StopDBInstanceResponse xmlns="http://rds.amazonaws.com/doc/2014-10-31/">
+  <StopDBInstanceResult>
+  {{ database.to_xml() }}
+  </StopDBInstanceResult>
+  <ResponseMetadata>
+    <RequestId>523e3218-afc7-11c3-90f5-f90431260ab8</RequestId>
+  </ResponseMetadata>
+</StopDBInstanceResponse>"""
 
 DELETE_DATABASE_TEMPLATE = """<DeleteDBInstanceResponse xmlns="http://rds.amazonaws.com/doc/2014-09-01/">
   <DeleteDBInstanceResult>

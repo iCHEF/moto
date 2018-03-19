@@ -5,9 +5,11 @@ import json
 from datetime import datetime
 from random import random
 
+import re
 import sure  # noqa
 
 import boto3
+from botocore.exceptions import ClientError, ParamValidationError
 from dateutil.tz import tzlocal
 
 from moto import mock_ecr
@@ -139,19 +141,6 @@ def test_describe_repositories_3():
 
     respository_uri = '012345678910.dkr.ecr.us-east-1.amazonaws.com/test_repository1'
     response['repositories'][0]['repositoryUri'].should.equal(respository_uri)
-
-
-@mock_ecr
-def test_describe_repositories_4():
-    client = boto3.client('ecr', region_name='us-east-1')
-    _ = client.create_repository(
-        repositoryName='test_repository1'
-    )
-    _ = client.create_repository(
-        repositoryName='test_repository0'
-    )
-    response = client.describe_repositories(repositoryNames=['not_a_valid_name'])
-    len(response['repositories']).should.equal(0)
 
 
 @mock_ecr
@@ -345,6 +334,54 @@ def test_describe_images_by_tag():
 
 
 @mock_ecr
+def test_describe_repository_that_doesnt_exist():
+    client = boto3.client('ecr', region_name='us-east-1')
+
+    error_msg = re.compile(
+        r".*The repository with name 'repo-that-doesnt-exist' does not exist in the registry with id '123'.*",
+        re.MULTILINE)
+    client.describe_repositories.when.called_with(
+        repositoryNames=['repo-that-doesnt-exist'],
+        registryId='123',
+    ).should.throw(ClientError, error_msg)
+
+@mock_ecr
+def test_describe_image_that_doesnt_exist():
+    client = boto3.client('ecr', region_name='us-east-1')
+    client.create_repository(repositoryName='test_repository')
+
+    error_msg1 = re.compile(
+        r".*The image with imageId {imageDigest:'null', imageTag:'testtag'} does not exist within "
+        r"the repository with name 'test_repository' in the registry with id '123'.*",
+        re.MULTILINE)
+
+    client.describe_images.when.called_with(
+        repositoryName='test_repository', imageIds=[{'imageTag': 'testtag'}], registryId='123',
+    ).should.throw(ClientError, error_msg1)
+
+    error_msg2 = re.compile(
+        r".*The repository with name 'repo-that-doesnt-exist' does not exist in the registry with id '123'.*",
+        re.MULTILINE)
+    client.describe_images.when.called_with(
+        repositoryName='repo-that-doesnt-exist', imageIds=[{'imageTag': 'testtag'}], registryId='123',
+    ).should.throw(ClientError, error_msg2)
+
+
+@mock_ecr
+def test_delete_repository_that_doesnt_exist():
+    client = boto3.client('ecr', region_name='us-east-1')
+
+    error_msg = re.compile(
+        r".*The repository with name 'repo-that-doesnt-exist' does not exist in the registry with id '123'.*",
+        re.MULTILINE)
+
+    client.delete_repository.when.called_with(
+        repositoryName='repo-that-doesnt-exist',
+        registryId='123').should.throw(
+        ClientError, error_msg)
+
+
+@mock_ecr
 def test_describe_images_by_digest():
     client = boto3.client('ecr', region_name='us-east-1')
     _ = client.create_repository(
@@ -377,7 +414,8 @@ def test_get_authorization_token_assume_region():
     client = boto3.client('ecr', region_name='us-east-1')
     auth_token_response = client.get_authorization_token()
 
-    list(auth_token_response.keys()).should.equal(['authorizationData', 'ResponseMetadata'])
+    auth_token_response.should.contain('authorizationData')
+    auth_token_response.should.contain('ResponseMetadata')
     auth_token_response['authorizationData'].should.equal([
         {
             'authorizationToken': 'QVdTOnVzLWVhc3QtMS1hdXRoLXRva2Vu',
@@ -392,7 +430,8 @@ def test_get_authorization_token_explicit_regions():
     client = boto3.client('ecr', region_name='us-east-1')
     auth_token_response = client.get_authorization_token(registryIds=['us-east-1', 'us-west-1'])
 
-    list(auth_token_response.keys()).should.equal(['authorizationData', 'ResponseMetadata'])
+    auth_token_response.should.contain('authorizationData')
+    auth_token_response.should.contain('ResponseMetadata')
     auth_token_response['authorizationData'].should.equal([
         {
             'authorizationToken': 'QVdTOnVzLWVhc3QtMS1hdXRoLXRva2Vu',
@@ -406,3 +445,117 @@ def test_get_authorization_token_explicit_regions():
 
         }
     ])
+
+
+@mock_ecr
+def test_batch_get_image():
+    client = boto3.client('ecr', region_name='us-east-1')
+    _ = client.create_repository(
+        repositoryName='test_repository'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='latest'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='v1'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='v2'
+    )
+
+    response = client.batch_get_image(
+        repositoryName='test_repository',
+        imageIds=[
+            {
+                'imageTag': 'v2'
+            },
+        ],
+    )
+
+    type(response['images']).should.be(list)
+    len(response['images']).should.be(1)
+
+    response['images'][0]['imageManifest'].should.contain("vnd.docker.distribution.manifest.v2+json")
+    response['images'][0]['registryId'].should.equal("012345678910")
+    response['images'][0]['repositoryName'].should.equal("test_repository")
+
+    response['images'][0]['imageId']['imageTag'].should.equal("v2")
+    response['images'][0]['imageId']['imageDigest'].should.contain("sha")
+
+    type(response['failures']).should.be(list)
+    len(response['failures']).should.be(0)
+
+
+@mock_ecr
+def test_batch_get_image_that_doesnt_exist():
+    client = boto3.client('ecr', region_name='us-east-1')
+    _ = client.create_repository(
+        repositoryName='test_repository'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='latest'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='v1'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='v2'
+    )
+
+    response = client.batch_get_image(
+        repositoryName='test_repository',
+        imageIds=[
+            {
+                'imageTag': 'v5'
+            },
+        ],
+    )
+
+    type(response['images']).should.be(list)
+    len(response['images']).should.be(0)
+
+    type(response['failures']).should.be(list)
+    len(response['failures']).should.be(1)
+    response['failures'][0]['failureReason'].should.equal("Requested image not found")
+    response['failures'][0]['failureCode'].should.equal("ImageNotFound")
+    response['failures'][0]['imageId']['imageTag'].should.equal("v5")
+
+
+@mock_ecr
+def test_batch_get_image_no_tags():
+    client = boto3.client('ecr', region_name='us-east-1')
+    _ = client.create_repository(
+        repositoryName='test_repository'
+    )
+
+    _ = client.put_image(
+        repositoryName='test_repository',
+        imageManifest=json.dumps(_create_image_manifest()),
+        imageTag='latest'
+    )
+
+    error_msg = re.compile(
+        r".*Missing required parameter in input: \"imageIds\".*",
+        re.MULTILINE)
+
+    client.batch_get_image.when.called_with(
+        repositoryName='test_repository').should.throw(
+            ParamValidationError, error_msg)

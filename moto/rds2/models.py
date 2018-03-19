@@ -2,6 +2,7 @@ from __future__ import unicode_literals
 
 import copy
 import datetime
+import os
 
 from collections import defaultdict
 import boto.rds2
@@ -18,7 +19,11 @@ from .exceptions import (RDSClientError,
                          DBSnapshotNotFoundError,
                          DBSecurityGroupNotFoundError,
                          DBSubnetGroupNotFoundError,
-                         DBParameterGroupNotFoundError)
+                         DBParameterGroupNotFoundError,
+                         InvalidDBClusterStateFaultError,
+                         InvalidDBInstanceStateError,
+                         SnapshotQuotaExceededError,
+                         DBSnapshotAlreadyExistsError)
 
 
 class Database(BaseModel):
@@ -674,10 +679,14 @@ class RDS2Backend(BaseBackend):
         self.databases[database_id] = database
         return database
 
-    def create_snapshot(self, db_instance_identifier, db_snapshot_identifier, tags):
+    def create_snapshot(self, db_instance_identifier, db_snapshot_identifier, tags=None):
         database = self.databases.get(db_instance_identifier)
         if not database:
             raise DBInstanceNotFoundError(db_instance_identifier)
+        if db_snapshot_identifier in self.snapshots:
+            raise DBSnapshotAlreadyExistsError(db_snapshot_identifier)
+        if len(self.snapshots) >= int(os.environ.get('MOTO_RDS_SNAPSHOT_LIMIT', '100')):
+            raise SnapshotQuotaExceededError()
         snapshot = Snapshot(database, db_snapshot_identifier, tags)
         self.snapshots[db_snapshot_identifier] = snapshot
         return snapshot
@@ -695,7 +704,8 @@ class RDS2Backend(BaseBackend):
         if self.arn_regex.match(source_database_id):
             db_kwargs['region'] = self.region
 
-        replica = copy.deepcopy(primary)
+        # Shouldn't really copy here as the instance is duplicated. RDS replicas have different instances.
+        replica = copy.copy(primary)
         replica.update(db_kwargs)
         replica.set_as_replica()
         self.databases[database_id] = replica
@@ -726,11 +736,36 @@ class RDS2Backend(BaseBackend):
 
     def modify_database(self, db_instance_identifier, db_kwargs):
         database = self.describe_databases(db_instance_identifier)[0]
+        if 'new_db_instance_identifier' in db_kwargs:
+            del self.databases[db_instance_identifier]
+            db_instance_identifier = db_kwargs['db_instance_identifier'] = db_kwargs.pop('new_db_instance_identifier')
+            self.databases[db_instance_identifier] = database
         database.update(db_kwargs)
         return database
 
     def reboot_db_instance(self, db_instance_identifier):
         database = self.describe_databases(db_instance_identifier)[0]
+        return database
+
+    def stop_database(self, db_instance_identifier, db_snapshot_identifier=None):
+        database = self.describe_databases(db_instance_identifier)[0]
+        # todo: certain rds types not allowed to be stopped at this time.
+        if database.is_replica or database.multi_az:
+                # todo: more db types not supported by stop/start instance api
+                raise InvalidDBClusterStateFaultError(db_instance_identifier)
+        if database.status != 'available':
+            raise InvalidDBInstanceStateError(db_instance_identifier, 'stop')
+        if db_snapshot_identifier:
+            self.create_snapshot(db_instance_identifier, db_snapshot_identifier)
+        database.status = 'stopped'
+        return database
+
+    def start_database(self, db_instance_identifier):
+        database = self.describe_databases(db_instance_identifier)[0]
+        # todo: bunch of different error messages to be generated from this api call
+        if database.status != 'stopped':
+            raise InvalidDBInstanceStateError(db_instance_identifier, 'start')
+        database.status = 'available'
         return database
 
     def find_db_from_id(self, db_id):

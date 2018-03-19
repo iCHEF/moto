@@ -10,7 +10,10 @@ from moto.cloudformation.models import FakeStack
 from moto.cloudformation.parsing import resource_class_from_type, parse_condition, Export
 from moto.sqs.models import Queue
 from moto.s3.models import FakeBucket
+from moto.cloudformation.utils import yaml_tag_constructor
 from boto.cloudformation.stack import Output
+
+
 
 dummy_template = {
     "AWSTemplateFormatVersion": "2010-09-09",
@@ -68,6 +71,14 @@ get_attribute_output = {
     "Outputs": {
         "Output1": {
             "Value": {"Fn::GetAtt": ["Queue", "QueueName"]}
+        }
+    }
+}
+
+get_availability_zones_output = {
+    "Outputs": {
+        "Output1": {
+            "Value": {"Fn::GetAZs": ""}
         }
     }
 }
@@ -143,6 +154,8 @@ bad_outputs_template = dict(
     list(dummy_template.items()) + list(bad_output.items()))
 get_attribute_outputs_template = dict(
     list(dummy_template.items()) + list(get_attribute_output.items()))
+get_availability_zones_template = dict(
+    list(dummy_template.items()) + list(get_availability_zones_output.items()))
 
 dummy_template_json = json.dumps(dummy_template)
 name_type_template_json = json.dumps(name_type_template)
@@ -150,6 +163,8 @@ output_type_template_json = json.dumps(outputs_template)
 bad_output_template_json = json.dumps(bad_outputs_template)
 get_attribute_outputs_template_json = json.dumps(
     get_attribute_outputs_template)
+get_availability_zones_template_json = json.dumps(
+    get_availability_zones_template)
 split_select_template_json = json.dumps(split_select_template)
 sub_template_json = json.dumps(sub_template)
 export_value_template_json = json.dumps(export_value_template)
@@ -238,6 +253,21 @@ def test_parse_stack_with_get_attribute_outputs():
     output = list(stack.output_map.values())[0]
     output.should.be.a(Output)
     output.value.should.equal("my-queue")
+
+
+def test_parse_stack_with_get_availability_zones():
+    stack = FakeStack(
+        stack_id="test_id",
+        name="test_stack",
+        template=get_availability_zones_template_json,
+        parameters={},
+        region_name='us-east-1')
+
+    stack.output_map.should.have.length_of(1)
+    list(stack.output_map.keys())[0].should.equal('Output1')
+    output = list(stack.output_map.values())[0]
+    output.should.be.a(Output)
+    output.value.should.equal([ "us-east-1a", "us-east-1b", "us-east-1c", "us-east-1d" ])
 
 
 def test_parse_stack_with_bad_get_attribute_outputs():
@@ -380,3 +410,47 @@ def test_import():
 
     queue = import_stack.resource_map['Queue']
     queue.name.should.equal("value")
+
+
+
+def test_short_form_func_in_yaml_teamplate():
+    template = """---
+    KeyB64: !Base64 valueToEncode
+    KeyRef: !Ref foo
+    KeyAnd: !And
+      - A
+      - B
+    KeyEquals: !Equals [A, B]
+    KeyIf: !If [A, B, C]
+    KeyNot: !Not [A]
+    KeyOr: !Or [A, B]
+    KeyFindInMap: !FindInMap [A, B, C]
+    KeyGetAtt: !GetAtt A.B
+    KeyGetAZs: !GetAZs A
+    KeyImportValue: !ImportValue A
+    KeyJoin: !Join [ ":", [A, B, C] ]
+    KeySelect: !Select [A, B]
+    KeySplit: !Split [A, B]
+    KeySub: !Sub A
+    """
+    yaml.add_multi_constructor('', yaml_tag_constructor)
+    template_dict = yaml.load(template)
+    key_and_expects = [
+        ['KeyRef', {'Ref': 'foo'}],
+        ['KeyB64', {'Fn::Base64': 'valueToEncode'}],
+        ['KeyAnd', {'Fn::And': ['A', 'B']}],
+        ['KeyEquals', {'Fn::Equals': ['A', 'B']}],
+        ['KeyIf', {'Fn::If': ['A', 'B', 'C']}],
+        ['KeyNot', {'Fn::Not': ['A']}],
+        ['KeyOr', {'Fn::Or': ['A', 'B']}],
+        ['KeyFindInMap', {'Fn::FindInMap': ['A', 'B', 'C']}],
+        ['KeyGetAtt', {'Fn::GetAtt': ['A', 'B']}],
+        ['KeyGetAZs', {'Fn::GetAZs': 'A'}],
+        ['KeyImportValue', {'Fn::ImportValue': 'A'}],
+        ['KeyJoin', {'Fn::Join': [ ":", [ 'A', 'B', 'C' ] ]}],
+        ['KeySelect', {'Fn::Select': ['A', 'B']}],
+        ['KeySplit', {'Fn::Split': ['A', 'B']}],
+        ['KeySub', {'Fn::Sub': 'A'}],
+    ]
+    for k, v in key_and_expects:
+        template_dict.should.have.key(k).which.should.be.equal(v)
